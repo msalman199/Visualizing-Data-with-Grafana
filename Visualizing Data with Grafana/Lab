@@ -1,0 +1,875 @@
+Visualizing Data with Grafana
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Install and configure Grafana on a Linux system
+Set up Prometheus as a data source for metrics visualization
+Configure Jaeger as a data source for distributed tracing
+Create comprehensive dashboards to visualize OpenTelemetry metrics and traces
+Build custom panels and queries for monitoring application performance
+Understand the integration between OpenTelemetry, Prometheus, Jaeger, and Grafana
+Implement real-time monitoring and alerting capabilities
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Linux command line operations
+Familiarity with Docker and containerization concepts
+Knowledge of OpenTelemetry fundamentals from previous labs
+Understanding of metrics and distributed tracing concepts
+Basic knowledge of YAML configuration files
+Familiarity with web browsers and HTTP concepts
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated environment. The provided Linux machine is bare metal with no pre-installed tools, so you will install all required components during the lab exercises.
+
+Task 1: Set up Grafana to Visualize Metrics and Traces from Prometheus and Jaeger
+Subtask 1.1: Install Docker and Docker Compose
+First, we need to install Docker to run our monitoring stack.
+
+# Update the package index
+sudo apt update
+
+# Install required packages
+sudo apt install -y apt-transport-https ca-certificates curl gnupg lsb-release
+
+# Add Docker's official GPG key
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+# Set up the stable repository
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# Update package index again
+sudo apt update
+
+# Install Docker Engine
+sudo apt install -y docker-ce docker-ce-cli containerd.io
+
+# Add current user to docker group
+sudo usermod -aG docker $USER
+
+# Start and enable Docker service
+sudo systemctl start docker
+sudo systemctl enable docker
+
+# Install Docker Compose
+sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+sudo chmod +x /usr/local/bin/docker-compose
+
+# Verify installations
+docker --version
+docker-compose --version
+Log out and log back in for the group changes to take effect:
+
+# Log out and back in, or use newgrp
+newgrp docker
+Subtask 1.2: Create the Monitoring Stack Configuration
+Create a directory structure for our monitoring setup:
+
+# Create project directory
+mkdir -p ~/grafana-lab
+cd ~/grafana-lab
+
+# Create subdirectories for configurations
+mkdir -p config/prometheus config/grafana config/jaeger data/prometheus data/grafana
+Create the Prometheus configuration file:
+
+cat > config/prometheus/prometheus.yml << 'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'sample-app'
+    static_configs:
+      - targets: ['sample-app:8080']
+    scrape_interval: 5s
+    metrics_path: '/metrics'
+
+  - job_name: 'otel-collector'
+    static_configs:
+      - targets: ['otel-collector:8889']
+    scrape_interval: 10s
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+EOF
+Create the OpenTelemetry Collector configuration:
+
+cat > config/otel-collector.yml << 'EOF'
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: 'otel-collector'
+          scrape_interval: 10s
+          static_configs:
+            - targets: ['0.0.0.0:8889']
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+  
+  memory_limiter:
+    limit_mib: 512
+
+exporters:
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    
+  jaeger:
+    endpoint: jaeger:14250
+    tls:
+      insecure: true
+      
+  logging:
+    loglevel: debug
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [jaeger, logging]
+    
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus, logging]
+EOF
+Create the Grafana provisioning configuration:
+
+# Create datasources configuration
+mkdir -p config/grafana/provisioning/datasources
+cat > config/grafana/provisioning/datasources/datasources.yml << 'EOF'
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    
+  - name: Jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    editable: true
+    
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: true
+EOF
+Create dashboards provisioning configuration:
+
+mkdir -p config/grafana/provisioning/dashboards
+cat > config/grafana/provisioning/dashboards/dashboards.yml << 'EOF'
+apiVersion: 1
+
+providers:
+  - name: 'default'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+EOF
+Subtask 1.3: Create Sample Application with OpenTelemetry
+Create a simple Python application that generates metrics and traces:
+
+cat > sample-app.py << 'EOF'
+import time
+import random
+import logging
+from flask import Flask, request, jsonify
+from opentelemetry import trace, metrics
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.instrumentation.flask import FlaskInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.sdk.resources import Resource
+from prometheus_client import Counter, Histogram, Gauge, generate_latest
+import requests
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Create resource
+resource = Resource.create({
+    "service.name": "sample-app",
+    "service.version": "1.0.0",
+})
+
+# Configure tracing
+trace.set_tracer_provider(TracerProvider(resource=resource))
+tracer = trace.get_tracer(__name__)
+
+# Configure OTLP trace exporter
+otlp_trace_exporter = OTLPSpanExporter(
+    endpoint="http://otel-collector:4317",
+    insecure=True
+)
+
+# Add span processor
+span_processor = BatchSpanProcessor(otlp_trace_exporter)
+trace.get_tracer_provider().add_span_processor(span_processor)
+
+# Configure metrics
+metric_reader = PeriodicExportingMetricReader(
+    OTLPMetricExporter(
+        endpoint="http://otel-collector:4317",
+        insecure=True
+    ),
+    export_interval_millis=5000
+)
+
+metrics.set_meter_provider(MeterProvider(
+    resource=resource,
+    metric_readers=[metric_reader]
+))
+
+meter = metrics.get_meter(__name__)
+
+# Create metrics
+request_counter = meter.create_counter(
+    "http_requests_total",
+    description="Total number of HTTP requests"
+)
+
+request_duration = meter.create_histogram(
+    "http_request_duration_seconds",
+    description="HTTP request duration in seconds"
+)
+
+active_connections = meter.create_up_down_counter(
+    "active_connections",
+    description="Number of active connections"
+)
+
+# Prometheus metrics
+prom_request_counter = Counter('flask_requests_total', 'Total Flask requests', ['method', 'endpoint'])
+prom_request_duration = Histogram('flask_request_duration_seconds', 'Flask request duration')
+prom_active_users = Gauge('flask_active_users', 'Number of active users')
+
+# Create Flask app
+app = Flask(__name__)
+
+# Instrument Flask
+FlaskInstrumentor().instrument_app(app)
+RequestsInstrumentor().instrument()
+
+@app.route('/metrics')
+def metrics_endpoint():
+    return generate_latest()
+
+@app.route('/')
+def home():
+    with tracer.start_as_current_span("home_request") as span:
+        start_time = time.time()
+        
+        # Add span attributes
+        span.set_attribute("http.method", "GET")
+        span.set_attribute("http.route", "/")
+        
+        # Simulate some work
+        time.sleep(random.uniform(0.1, 0.5))
+        
+        # Update metrics
+        request_counter.add(1, {"method": "GET", "endpoint": "/"})
+        duration = time.time() - start_time
+        request_duration.record(duration, {"method": "GET", "endpoint": "/"})
+        
+        # Update Prometheus metrics
+        prom_request_counter.labels(method='GET', endpoint='/').inc()
+        prom_request_duration.observe(duration)
+        prom_active_users.set(random.randint(10, 100))
+        
+        return jsonify({
+            "message": "Hello from Sample App!",
+            "timestamp": time.time(),
+            "duration": duration
+        })
+
+@app.route('/api/users')
+def get_users():
+    with tracer.start_as_current_span("get_users") as span:
+        start_time = time.time()
+        
+        span.set_attribute("http.method", "GET")
+        span.set_attribute("http.route", "/api/users")
+        
+        # Simulate database query
+        with tracer.start_as_current_span("database_query") as db_span:
+            db_span.set_attribute("db.operation", "SELECT")
+            db_span.set_attribute("db.table", "users")
+            time.sleep(random.uniform(0.05, 0.2))
+        
+        # Simulate some processing
+        time.sleep(random.uniform(0.1, 0.3))
+        
+        duration = time.time() - start_time
+        request_counter.add(1, {"method": "GET", "endpoint": "/api/users"})
+        request_duration.record(duration, {"method": "GET", "endpoint": "/api/users"})
+        
+        prom_request_counter.labels(method='GET', endpoint='/api/users').inc()
+        prom_request_duration.observe(duration)
+        
+        users = [
+            {"id": 1, "name": "Alice", "email": "alice@example.com"},
+            {"id": 2, "name": "Bob", "email": "bob@example.com"},
+            {"id": 3, "name": "Charlie", "email": "charlie@example.com"}
+        ]
+        
+        return jsonify(users)
+
+@app.route('/api/slow')
+def slow_endpoint():
+    with tracer.start_as_current_span("slow_request") as span:
+        start_time = time.time()
+        
+        span.set_attribute("http.method", "GET")
+        span.set_attribute("http.route", "/api/slow")
+        
+        # Simulate slow operation
+        sleep_time = random.uniform(1.0, 3.0)
+        span.set_attribute("sleep.duration", sleep_time)
+        time.sleep(sleep_time)
+        
+        duration = time.time() - start_time
+        request_counter.add(1, {"method": "GET", "endpoint": "/api/slow"})
+        request_duration.record(duration, {"method": "GET", "endpoint": "/api/slow"})
+        
+        prom_request_counter.labels(method='GET', endpoint='/api/slow').inc()
+        prom_request_duration.observe(duration)
+        
+        return jsonify({
+            "message": "This was a slow operation",
+            "duration": duration
+        })
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "timestamp": time.time()})
+
+if __name__ == '__main__':
+    logger.info("Starting sample application...")
+    app.run(host='0.0.0.0', port=8080, debug=True)
+EOF
+Create the Dockerfile for the sample application:
+
+cat > Dockerfile.sample-app << 'EOF'
+FROM python:3.9-slim
+
+WORKDIR /app
+
+RUN pip install flask opentelemetry-api opentelemetry-sdk \
+    opentelemetry-exporter-otlp-proto-grpc \
+    opentelemetry-instrumentation-flask \
+    opentelemetry-instrumentation-requests \
+    prometheus-client requests
+
+COPY sample-app.py .
+
+EXPOSE 8080
+
+CMD ["python", "sample-app.py"]
+EOF
+Subtask 1.4: Create Docker Compose Configuration
+Create the main docker-compose.yml file:
+
+cat > docker-compose.yml << 'EOF'
+version: '3.8'
+
+services:
+  # Jaeger
+  jaeger:
+    image: jaegertracing/all-in-one:1.50
+    container_name: jaeger
+    ports:
+      - "16686:16686"
+      - "14250:14250"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - monitoring
+
+  # OpenTelemetry Collector
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.88.0
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector.yml"]
+    volumes:
+      - ./config/otel-collector.yml:/etc/otel-collector.yml
+    ports:
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+      - "8889:8889"   # Prometheus metrics
+    depends_on:
+      - jaeger
+    networks:
+      - monitoring
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./data/prometheus:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - monitoring
+
+  # Node Exporter
+  node-exporter:
+    image: prom/node-exporter:v1.6.1
+    container_name: node-exporter
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - monitoring
+
+  # Loki
+  loki:
+    image: grafana/loki:2.9.0
+    container_name: loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - monitoring
+
+  # Grafana
+  grafana:
+    image: grafana/grafana:10.1.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - ./data/grafana:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+      - jaeger
+      - loki
+    networks:
+      - monitoring
+
+  # Sample Application
+  sample-app:
+    build:
+      context: .
+      dockerfile: Dockerfile.sample-app
+    container_name: sample-app
+    ports:
+      - "8080:8080"
+    depends_on:
+      - otel-collector
+    networks:
+      - monitoring
+
+networks:
+  monitoring:
+    driver: bridge
+EOF
+Subtask 1.5: Start the Monitoring Stack
+Set proper permissions and start the services:
+
+# Set permissions for data directories
+sudo chown -R 472:472 data/grafana
+sudo chown -R 65534:65534 data/prometheus
+
+# Build and start all services
+docker-compose up -d
+
+# Check if all services are running
+docker-compose ps
+
+# View logs to ensure everything is working
+docker-compose logs -f --tail=50
+Wait for all services to start completely. You can check individual service logs:
+
+# Check Grafana logs
+docker-compose logs grafana
+
+# Check Prometheus logs
+docker-compose logs prometheus
+
+# Check Jaeger logs
+docker-compose logs jaeger
+
+# Check sample app logs
+docker-compose logs sample-app
+Subtask 1.6: Generate Sample Data
+Create a script to generate traffic to our sample application:
+
+cat > generate_traffic.py << 'EOF'
+import requests
+import time
+import random
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+BASE_URL = "http://localhost:8080"
+
+def make_request(endpoint):
+    try:
+        response = requests.get(f"{BASE_URL}{endpoint}", timeout=10)
+        print(f"Request to {endpoint}: {response.status_code}")
+        return response.status_code
+    except Exception as e:
+        print(f"Error requesting {endpoint}: {e}")
+        return None
+
+def generate_traffic():
+    endpoints = [
+        "/",
+        "/api/users", 
+        "/api/slow",
+        "/health"
+    ]
+    
+    while True:
+        endpoint = random.choice(endpoints)
+        make_request(endpoint)
+        time.sleep(random.uniform(0.5, 2.0))
+
+def run_load_test():
+    print("Starting traffic generation...")
+    
+    # Create multiple threads to simulate concurrent users
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = []
+        for i in range(3):
+            future = executor.submit(generate_traffic)
+            futures.append(future)
+        
+        try:
+            # Run for a while
+            time.sleep(300)  # Run for 5 minutes
+        except KeyboardInterrupt:
+            print("Stopping traffic generation...")
+
+if __name__ == "__main__":
+    run_load_test()
+EOF
+
+# Install requests if not available
+pip3 install requests
+
+# Run traffic generation in background
+python3 generate_traffic.py &
+TRAFFIC_PID=$!
+echo "Traffic generation started with PID: $TRAFFIC_PID"
+Subtask 1.7: Access and Configure Grafana
+Open your web browser and navigate to http://localhost:3000
+
+Login credentials:
+
+Username: admin
+Password: admin123
+Verify that the data sources are configured correctly:
+
+Go to Configuration → Data Sources
+You should see three data sources:
+Prometheus (default)
+Jaeger
+Loki
+Test each data source:
+
+# Test Prometheus connection
+curl "http://localhost:9090/api/v1/query?query=up"
+
+# Test Jaeger connection
+curl "http://localhost:16686/api/services"
+
+# Test sample app metrics
+curl "http://localhost:8080/metrics"
+Subtask 1.8: Create Custom Dashboards
+Create Application Performance Dashboard
+In Grafana, click the + icon and select Dashboard
+Click Add new panel
+Configure the first panel for Request Rate:
+Panel Title: HTTP Request Rate Query: rate(flask_requests_total[5m]) Visualization: Time series Unit: requests/sec
+
+Add a second panel for Request Duration:
+Panel Title: HTTP Request Duration Query: histogram_quantile(0.95, rate(flask_request_duration_seconds_bucket[5m])) Visualization: Time series Unit: seconds
+
+Add a third panel for Active Users:
+Panel Title: Active Users Query: flask_active_users Visualization: Stat Unit: short
+
+Add a fourth panel for Error Rate:
+Panel Title: Error Rate Query: rate(flask_requests_total{code!="200"}[5m]) / rate(flask_requests_total[5m]) * 100 Visualization: Time series Unit: percent
+
+Save the dashboard as "Application Performance".
+
+Create System Metrics Dashboard
+Create another dashboard for system metrics:
+
+Create a new dashboard
+Add panels for:
+CPU Usage:
+
+100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+Memory Usage:
+
+(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100
+Disk Usage:
+
+100 - ((node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100)
+Network Traffic:
+
+rate(node_network_receive_bytes_total[5m])
+rate(node_network_transmit_bytes_total[5m])
+Save this dashboard as "System Metrics".
+
+Subtask 1.9: Configure Trace Visualization
+In Grafana, go to Explore
+Select Jaeger as the data source
+In the Service dropdown, select sample-app
+Click Run Query to see traces
+Create a Traces Dashboard:
+
+Create a new dashboard
+
+Add a Traces panel:
+
+Data source: Jaeger
+Service: sample-app
+Operation: All operations
+Add a Trace Duration panel:
+
+Use Prometheus data source
+Query: histogram_quantile(0.95, sum(rate(duration_bucket[5m])) by (le))
+Subtask 1.10: Set Up Alerting
+Configure alerting rules in Grafana:
+
+Go to Alerting → Alert Rules
+Click New Rule
+Create an alert for High Response Time:
+Rule Name: High Response Time Query: histogram_quantile(0.95, rate(flask_request_duration_seconds_bucket[5m])) Condition: IS ABOVE 2 (seconds) Evaluation: Every 1m for 2m
+
+Create an alert for High Error Rate:
+Rule Name: High Error Rate Query: rate(flask_requests_total{code!="200"}[5m]) / rate(flask_requests_total[5m]) * 100 Condition: IS ABOVE 5 (percent) Evaluation: Every 1m for 1m
+
+Subtask 1.11: Create Advanced Visualizations
+Service Map Visualization
+Create a service dependency visualization:
+
+Create a new dashboard panel
+Use Node Graph visualization
+Configure queries to show service relationships:
+# Nodes query
+sum by (service_name) (rate(http_requests_total[5m]))
+
+# Edges query  
+sum by (source_service, target_service) (rate(http_requests_total[5m]))
+Heatmap for Request Duration
+Add a new panel with Heatmap visualization
+Use query:
+sum(rate(flask_request_duration_seconds_bucket[5m])) by (le)
+Subtask 1.12: Export and Import Dashboards
+Export your dashboards for backup:
+
+Go to each dashboard
+Click the Share icon
+Go to Export tab
+Click Save to file
+Create a dashboard from JSON:
+
+cat > dashboard-backup.json << 'EOF'
+{
+  "dashboard": {
+    "id": null,
+    "title": "Sample Application Monitoring",
+    "tags": ["monitoring", "sample-app"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Request Rate",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "rate(flask_requests_total[5m])",
+            "refId": "A"
+          }
+        ]
+      }
+    ],
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "refresh": "5s"
+  }
+}
+EOF
+Subtask 1.13: Verify Complete Integration
+Test the complete monitoring pipeline:
+
+Generate different types of traffic:
+# Test normal requests
+for i in {1..10}; do curl http://localhost:8080/; sleep 1; done
+
+# Test slow requests
+for i in {1..5}; do curl http://localhost:8080/api/slow; sleep 2; done
+
+# Test API requests
+for i in {1..15}; do curl http://localhost:8080/api/users; sleep 0.5; done
+Verify metrics in Prometheus:
+
+Open http://localhost:9090
+Query: flask_requests_total
+Query: flask_request_duration_seconds
+Verify traces in Jaeger:
+
+Open http://localhost:16686
+Select service: sample-app
+Click "Find Traces"
+Verify visualizations in Grafana:
+
+Open http://localhost:3000
+Check all dashboards show data
+Verify real-time updates
+Subtask 1.14: Performance Optimization
+Optimize Grafana performance:
+
+# Create Grafana configuration file
+cat > config/grafana/grafana.ini << 'EOF'
+[server]
+http_port = 3000
+
+[database]
+type = sqlite3
+path = grafana.db
+
+[session]
+provider = memory
+
+[analytics]
+reporting_enabled = false
+check_for_updates = false
+
+[security]
+admin_user = admin
+admin_password = admin123
+
+[users]
+allow_sign_up = false
+
+[auth.anonymous]
+enabled = false
+
+[log]
+mode = console
+level = info
+
+[metrics]
+enabled = true
+interval_seconds = 10
+
+[alerting]
+enabled = true
+execute_alerts = true
+EOF
+
+# Update docker-compose to use custom config
+# Add to grafana service volumes:
+# - ./config/grafana/grafana.ini:/etc/grafana/grafana.ini
+Restart Grafana with the new configuration:
+
+docker-compose restart grafana
+Subtask 1.15: Troubleshooting and Validation
+Common troubleshooting steps:
+
+Check service connectivity:
+# Test all service endpoints
+curl -f http://localhost:3000/api/health || echo "Grafana not ready"
+curl -f http://localhost:9090/-/healthy || echo "Prometheus not ready"  
+curl -f http://localhost:16686/ || echo "Jaeger not ready"
+curl -f http://localhost:8080/health || echo "Sample app not ready"
+Verify data flow:
+# Check if metrics are being scraped
+curl "http://localhost:9090/api/v1/targets"
+
+# Check OpenTelemetry collector metrics
+curl "http://localhost:8889/metrics"
+
+# Check sample app metrics
+curl "http://localhost:8080/metrics"
+Check logs for errors:
+# Check all service logs
+docker-compose logs --tail=100
+
+# Check specific service logs
+docker-compose logs grafana | grep -i error
+docker-compose logs prometheus | grep -i error
+docker-compose logs jaeger | grep -i error
+Validate dashboard functionality:
+Ensure all panels show data
+Test time range selection
+Verify refresh functionality
+Test alert rules
+Conclusion
+In this comprehensive lab, you have successfully:
+
+Installed and configured Grafana as a powerful visualization platform for monitoring and observability
+Integrated Grafana with Prometheus to visualize metrics from your applications and infrastructure
+Connected Jaeger to Grafana for distributed tracing visualization and analysis
+Created comprehensive dashboards that provide real-time insights into application performance, system metrics, and user behavior
+Implemented OpenTelemetry integration that automatically collects and forwards metrics and traces to your monitoring stack
+Set up alerting rules to proactively monitor system health and performance thresholds
+Built advanced visualizations including service maps, heatmaps, and custom panels for different data types
+Established a complete observability pipeline that connects application instrumentation to visual insights
+This monitoring setup provides you with a production-ready observability stack that can scale with your applications. The combination of Prometheus for metrics, Jaeger for distributed tracing, and Grafana for visualization gives you comprehensive visibility into your system's behavior, performance bottlenecks, and operational health.
+
+The skills you've developed in this lab are essential for modern DevOps and Site Reliability Engineering practices, enabling you to maintain high-performance, reliable systems through data-driven insights and proactive monitoring. You can now extend this foundation to monitor complex microservices architectures, implement advanced alerting strategies, and create custom dashboards tailored to your specific operational needs.
